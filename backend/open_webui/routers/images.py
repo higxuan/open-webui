@@ -224,6 +224,35 @@ async def get_image_model(request):
             )
 
 
+def extract_response_image_b64(response_text: str) -> str | None:
+    image_b64 = None
+
+    for line in response_text.splitlines():
+        if not line.startswith('data:'):
+            continue
+
+        payload = line[5:].strip()
+        if payload == '[DONE]':
+            continue
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        if data.get('partial_image_b64'):
+            image_b64 = data['partial_image_b64']
+            continue
+
+        response = data.get('response')
+        if isinstance(response, dict):
+            for item in response.get('output', []) or []:
+                if isinstance(item, dict) and item.get('result'):
+                    image_b64 = item['result']
+
+    return image_b64
+
+
 class ImagesConfig(BaseModel):
     ENABLE_IMAGE_GENERATION: bool
     ENABLE_IMAGE_PROMPT_GENERATION: bool
@@ -622,54 +651,91 @@ async def image_generations(
             if ENABLE_FORWARD_USER_INFO_HEADERS:
                 headers = include_user_info_headers(headers, user)
 
-            url = f'{image_config.IMAGES_OPENAI_API_BASE_URL}/images/generations'
-            if image_config.IMAGES_OPENAI_API_VERSION:
-                url = f'{url}?api-version={image_config.IMAGES_OPENAI_API_VERSION}'
-
-            data = {
-                'model': model,
-                'prompt': form_data.prompt,
-                'n': form_data.n,
-                **(
-                    {'size': form_data.size or image_config.IMAGE_SIZE}
-                    if (form_data.size or image_config.IMAGE_SIZE)
-                    else {}
-                ),
-                **(
-                    {}
-                    if re.match(
-                        IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
-                        image_config.IMAGE_GENERATION_MODEL,
-                    )
-                    else {'response_format': 'b64_json'}
-                ),
-                **({} if not image_config.IMAGES_OPENAI_API_PARAMS else image_config.IMAGES_OPENAI_API_PARAMS),
-            }
-
             session = await get_session()
-            async with session.post(
-                url=url,
-                json=data,
-                headers=headers,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
-                r.raise_for_status()
-                res = await r.json(content_type=None)
+            openai_api_params = image_config.IMAGES_OPENAI_API_PARAMS or {}
+            if isinstance(openai_api_params, str):
+                openai_api_params = json.loads(openai_api_params) if openai_api_params else {}
 
-            images = []
+            if openai_api_params.get('api_type') == 'responses':
+                url = f'{image_config.IMAGES_OPENAI_API_BASE_URL}/responses'
+                tool = {
+                    'type': 'image_generation',
+                    'size': form_data.size or image_config.IMAGE_SIZE or size,
+                    **openai_api_params.get('tool', {}),
+                }
+                data = {
+                    'model': model,
+                    'stream': True,
+                    'input': [{'role': 'user', 'content': form_data.prompt}],
+                    'tools': [tool],
+                }
 
-            for image in res['data']:
-                if image_url := image.get('url', None):
-                    image_data, content_type = await get_image_data(
-                        image_url,
-                        {k: v for k, v in headers.items() if k != 'Content-Type'},
-                    )
-                else:
-                    image_data, content_type = await get_image_data(image['b64_json'])
+                async with session.post(
+                    url=url,
+                    json=data,
+                    headers=headers,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                ) as r:
+                    r.raise_for_status()
+                    response_chunks = []
+                    async for chunk in r.content.iter_chunked(8192):
+                        response_chunks.append(chunk.decode('utf-8', 'ignore'))
 
+                image_b64 = extract_response_image_b64(''.join(response_chunks))
+                if not image_b64:
+                    raise ValueError('No image payload found in Responses stream')
+
+                image_data, content_type = await get_image_data(image_b64)
                 _, url = await upload_image(request, image_data, content_type, {**data, **metadata}, user)
-                images.append({'url': url})
-            return images
+                return [{'url': url}]
+            else:
+                url = f'{image_config.IMAGES_OPENAI_API_BASE_URL}/images/generations'
+                if image_config.IMAGES_OPENAI_API_VERSION:
+                    url = f'{url}?api-version={image_config.IMAGES_OPENAI_API_VERSION}'
+
+                data = {
+                    'model': model,
+                    'prompt': form_data.prompt,
+                    'n': form_data.n,
+                    **(
+                        {'size': form_data.size or image_config.IMAGE_SIZE}
+                        if (form_data.size or image_config.IMAGE_SIZE)
+                        else {}
+                    ),
+                    **(
+                        {}
+                        if re.match(
+                            IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
+                            image_config.IMAGE_GENERATION_MODEL,
+                        )
+                        else {'response_format': 'b64_json'}
+                    ),
+                    **openai_api_params,
+                }
+
+                async with session.post(
+                    url=url,
+                    json=data,
+                    headers=headers,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                ) as r:
+                    r.raise_for_status()
+                    res = await r.json(content_type=None)
+
+                images = []
+
+                for image in res['data']:
+                    if image_url := image.get('url', None):
+                        image_data, content_type = await get_image_data(
+                            image_url,
+                            {k: v for k, v in headers.items() if k != 'Content-Type'},
+                        )
+                    else:
+                        image_data, content_type = await get_image_data(image['b64_json'])
+
+                    _, url = await upload_image(request, image_data, content_type, {**data, **metadata}, user)
+                    images.append({'url': url})
+                return images
 
         elif image_config.IMAGE_GENERATION_ENGINE == 'gemini':
             headers = {
