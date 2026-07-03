@@ -401,6 +401,7 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
                 {'id': 'dall-e-3', 'name': 'DALL·E 3'},
                 {'id': 'gpt-image-1', 'name': 'GPT-IMAGE 1'},
                 {'id': 'gpt-image-1.5', 'name': 'GPT-IMAGE 1.5'},
+                {'id': 'gpt-image-2', 'name': 'GPT-IMAGE 2'},
             ]
         elif image_config.IMAGE_GENERATION_ENGINE == 'gemini':
             return [

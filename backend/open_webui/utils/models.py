@@ -132,6 +132,10 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
     enabled_filter_ids = {function.id for function in await Functions.get_functions_by_type('filter', active_only=True)}
 
     custom_models = await Models.get_all_models()
+    custom_model_ids = {model.id for model in custom_models}
+    custom_models.extend(
+        builtin_model for builtin_model in Models.get_builtin_models() if builtin_model.id not in custom_model_ids
+    )
 
     # Single O(1) lookup: Ollama base names first, then exact IDs (exact wins).
     base_model_lookup = {}
@@ -398,6 +402,11 @@ async def check_model_access(user, model, db=None):
         model_info = await Models.get_model_by_id(model.get('id'), db=db)
         if not model_info:
             raise Exception('Model not found')
+        meta = model_info.meta.model_dump() if model_info.meta else {}
+        if meta.get('builtin'):
+            if not await has_base_model_access(user.id, model_info, db=db):
+                raise Exception('Model not found')
+            return
         elif not (
             user.id == model_info.user_id
             or await AccessGrants.has_access(
@@ -456,6 +465,18 @@ async def get_filtered_models(models, user, db=None):
 
             model_info = model_infos.get(model['id'])
             if model_info:
+                meta = model_info.get('meta') or {}
+                if meta.get('builtin'):
+                    registered_model_info = await Models.get_model_by_id(model['id'], db=db)
+                    if registered_model_info and await has_base_model_access(
+                        user.id,
+                        registered_model_info,
+                        user_group_ids=user_group_ids,
+                        db=db,
+                    ):
+                        filtered_models.append(model)
+                    continue
+
                 if (
                     (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
                     or user.id == model_info.get('user_id')

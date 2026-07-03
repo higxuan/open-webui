@@ -1303,7 +1303,7 @@ ENABLE_IMAGE_GENERATION = os.getenv('ENABLE_IMAGE_GENERATION', '').lower() == 't
 
 IMAGE_GENERATION_ENGINE = os.getenv('IMAGE_GENERATION_ENGINE', 'openai')
 
-IMAGE_GENERATION_MODEL = os.getenv('IMAGE_GENERATION_MODEL', '')
+IMAGE_GENERATION_MODEL = os.getenv('IMAGE_GENERATION_MODEL', 'gpt-5.5')
 
 # Regex pattern for models that support IMAGE_SIZE = "auto".
 IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN = os.getenv('IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN', '^gpt-image')
@@ -1458,7 +1458,7 @@ IMAGES_OPENAI_API_VERSION = os.getenv('IMAGES_OPENAI_API_VERSION', '')
 
 IMAGES_OPENAI_API_KEY = os.getenv('IMAGES_OPENAI_API_KEY', OPENAI_API_KEY)
 
-images_openai_params = os.getenv('IMAGES_OPENAI_PARAMS', '')
+images_openai_params = os.getenv('IMAGES_OPENAI_PARAMS', '{"api_type":"responses"}')
 try:
     images_openai_params = json.loads(images_openai_params)
 except json.JSONDecodeError:

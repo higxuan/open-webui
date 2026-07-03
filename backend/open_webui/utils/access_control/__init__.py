@@ -321,6 +321,12 @@ async def check_model_access(
         return
 
     if model_info:
+        meta = model_info.meta.model_dump() if getattr(model_info, 'meta', None) else {}
+        if meta.get('builtin'):
+            if not await has_base_model_access(user.id, model_info):
+                raise HTTPException(status_code=403, detail='Model not found')
+            return
+
         # Enforce for every non-admin role (including pending); never fail open.
         if user.role != 'admin':
             from open_webui.models.access_grants import AccessGrants

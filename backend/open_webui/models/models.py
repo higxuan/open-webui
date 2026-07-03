@@ -21,6 +21,10 @@ log = logging.getLogger(__name__)
 # don't flood the logs on every DB read (the validator fires per-row).
 _warned_profile_urls: set[str] = set()
 
+BUILTIN_IMAGE_MODEL_ID = 'gpt-image-2'
+BUILTIN_IMAGE_BASE_MODEL_ID = 'gpt-5.5'
+BUILTIN_IMAGE_MODEL_CREATED_AT = 1783010842
+
 
 # --- Models DB Schema ---
 
@@ -143,6 +147,32 @@ class ModelForm(BaseModel):
 
 
 class ModelsTable:
+    @staticmethod
+    def _get_builtin_model_by_id(id: str) -> ModelModel | None:
+        if id != BUILTIN_IMAGE_MODEL_ID:
+            return None
+
+        return ModelModel(
+            id=BUILTIN_IMAGE_MODEL_ID,
+            user_id='__system__',
+            base_model_id=BUILTIN_IMAGE_BASE_MODEL_ID,
+            name=BUILTIN_IMAGE_MODEL_ID,
+            params=ModelParams(function_calling='legacy'),
+            meta=ModelMeta(
+                description='Image generation preset via NewAPI Responses',
+                capabilities={'vision': True, 'image_generation': True},
+                defaultFeatureIds=['image_generation'],
+                builtin=True,
+            ),
+            access_grants=[],
+            is_active=True,
+            updated_at=BUILTIN_IMAGE_MODEL_CREATED_AT,
+            created_at=BUILTIN_IMAGE_MODEL_CREATED_AT,
+        )
+
+    def get_builtin_models(self) -> list[ModelModel]:
+        return [self._get_builtin_model_by_id(BUILTIN_IMAGE_MODEL_ID)]
+
     async def _get_access_grants(self, model_id: str, db: AsyncSession | None = None) -> list[AccessGrantModel]:
         return await AccessGrants.get_grants_by_resource('model', model_id, db=db)
 
@@ -450,7 +480,9 @@ class ModelsTable:
         try:
             async with get_async_db_context(db) as db:
                 model = await db.get(Model, id)
-                return await self._to_model_model(model, db=db) if model else None
+                if model:
+                    return await self._to_model_model(model, db=db)
+                return self._get_builtin_model_by_id(id)
         except Exception:
             return None
 
@@ -461,7 +493,7 @@ class ModelsTable:
                 models = result.scalars().all()
                 model_ids = [model.id for model in models]
                 grants_map = await AccessGrants.get_grants_by_resources('model', model_ids, db=db)
-                return [
+                resolved_models = [
                     await self._to_model_model(
                         model,
                         access_grants=grants_map.get(model.id, []),
@@ -469,6 +501,13 @@ class ModelsTable:
                     )
                     for model in models
                 ]
+                resolved_ids = {model.id for model in resolved_models}
+                resolved_models.extend(
+                    builtin
+                    for builtin in self.get_builtin_models()
+                    if builtin and builtin.id in ids and builtin.id not in resolved_ids
+                )
+                return resolved_models
         except Exception:
             return []
 
