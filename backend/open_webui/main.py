@@ -134,6 +134,7 @@ from open_webui.models.config import Config
 from open_webui.models.functions import Functions
 from open_webui.models.messages import Messages
 from open_webui.models.models import Models
+from open_webui.models.responses import ResponseStates
 from open_webui.models.users import Users
 from open_webui.routers import (
     analytics,
@@ -232,6 +233,7 @@ from open_webui.utils.models import (
     get_all_models,
     get_filtered_models,
 )
+from open_webui.utils.misc import get_content_from_message, get_message_list
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
     OAuthClientManager,
@@ -246,6 +248,14 @@ from open_webui.utils.oauth import (
 )
 from open_webui.utils.plugin import install_tool_and_function_dependencies
 from open_webui.utils.redis import get_redis_client
+from open_webui.utils.responses import (
+    chat_message_to_responses_output,
+    chat_response_to_responses_response,
+    message_id as responses_message_id,
+    response_id,
+    responses_input_to_messages,
+    responses_payload_to_chat_payload,
+)
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.session_pool import get_session
 from open_webui.utils.tools import set_terminal_servers, set_tool_servers
@@ -1077,7 +1087,9 @@ async def chat_completion(
         compact_token_threshold = form_data.get('params', {}).get('compact_token_threshold')
 
         # Model Params
-        if model_info_params.get('stream_response') is not None:
+        if request_params.get('stream_response') is not None:
+            form_data['stream'] = request_params.get('stream_response')
+        elif model_info_params.get('stream_response') is not None:
             form_data['stream'] = model_info_params.get('stream_response')
 
         if model_info_params.get('stream_delta_chunk_size'):
@@ -1667,6 +1679,382 @@ generate_chat_completion = chat_completion
 # Expose as app.state so internal callers (e.g. automations) can
 # use the full pipeline without importing from main.py (avoids circular deps).
 app.state.CHAT_COMPLETION_HANDLER = chat_completion
+
+
+def _responses_error(
+    message: str,
+    status_code: int = status.HTTP_400_BAD_REQUEST,
+    error_type: str = 'invalid_request_error',
+):
+    return JSONResponse(
+        status_code=status_code,
+        content={'error': {'message': message, 'type': error_type}},
+    )
+
+
+def _responses_clean_stored_messages(messages: list[dict] | None) -> list[dict]:
+    allowed_keys = {
+        'role',
+        'content',
+        'output',
+        'tool_calls',
+        'tool_call_id',
+        'name',
+        'files',
+        'contextSummary',
+    }
+
+    return [
+        {
+            key: value
+            for key, value in message.items()
+            if key in allowed_keys
+        }
+        for message in messages or []
+        if isinstance(message, dict) and message.get('role')
+    ]
+
+
+def _responses_input_chain(
+    *,
+    new_messages: list[dict],
+    parent_id: str | None,
+    model_id: str,
+    user_message_id: str,
+    assistant_message_id: str,
+) -> list[dict]:
+    input_messages = [message for message in new_messages if message.get('role') != 'system']
+    if not input_messages:
+        input_messages = [{'role': 'user', 'content': ''}]
+
+    input_ids = [responses_message_id('input') for _ in input_messages]
+    input_ids[-1] = user_message_id
+
+    stored_messages = []
+    now = int(time.time())
+    for index, message in enumerate(input_messages):
+        message_parent_id = parent_id if index == 0 else input_ids[index - 1]
+        child_id = assistant_message_id if index == len(input_messages) - 1 else input_ids[index + 1]
+
+        stored_message = {
+            'id': input_ids[index],
+            'parentId': message_parent_id,
+            'childrenIds': [child_id],
+            'role': message.get('role', 'user'),
+            'content': get_content_from_message(message) or '',
+            'timestamp': now + index,
+        }
+
+        for key in ('tool_calls', 'tool_call_id', 'name', 'output'):
+            if key in message:
+                stored_message[key] = message[key]
+
+        if index == len(input_messages) - 1:
+            stored_message['models'] = [model_id]
+
+        stored_messages.append(stored_message)
+
+    return stored_messages
+
+
+def _responses_chat_snapshot(
+    *,
+    chat_id: str,
+    model_id: str,
+    chain_messages: list[dict],
+    assistant_message_id: str,
+) -> dict:
+    current_message = chain_messages[-1]
+    history_messages = {message['id']: message for message in chain_messages}
+    history_messages[assistant_message_id] = {
+        'id': assistant_message_id,
+        'parentId': current_message['id'],
+        'childrenIds': [],
+        'role': 'assistant',
+        'content': '',
+        'done': False,
+        'model': model_id,
+        'timestamp': int(time.time()),
+    }
+
+    return {
+        'id': chat_id,
+        'title': 'Responses API',
+        'models': [model_id],
+        'history': {
+            'currentId': assistant_message_id,
+            'messages': history_messages,
+        },
+        'messages': [
+            {'role': message.get('role'), 'content': message.get('content', '')}
+            for message in chain_messages
+            if message.get('role') != 'tool'
+        ],
+        'files': [],
+        'tags': [],
+        'timestamp': int(time.time() * 1000),
+    }
+
+
+def _extract_chat_response_data(response) -> dict:
+    if isinstance(response, JSONResponse) and isinstance(response.body, bytes):
+        try:
+            return json.loads(response.body.decode('utf-8', 'replace'))
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(response, dict):
+        return response
+    return {}
+
+
+def _extract_chat_response_text(response_data: dict) -> str:
+    choices = response_data.get('choices') if isinstance(response_data, dict) else None
+    if isinstance(choices, list) and choices:
+        message = choices[0].get('message') or {}
+        content = message.get('content')
+        if isinstance(content, str):
+            return content
+    return ''
+
+
+async def _create_responses_chat_if_needed(
+    *,
+    chat_id: str,
+    model_id: str,
+    user_id: str,
+    chain_messages: list[dict],
+    assistant_message_id: str,
+):
+    chat = await Chats.get_chat_by_id(chat_id)
+    if chat:
+        return chat
+
+    chat = await Chats.insert_new_chat(
+        chat_id,
+        user_id,
+        ChatForm(
+            chat=_responses_chat_snapshot(
+                chat_id=chat_id,
+                model_id=model_id,
+                chain_messages=chain_messages,
+                assistant_message_id=assistant_message_id,
+            ),
+        ),
+    )
+    await Chats.toggle_chat_archive_by_id(chat_id)
+    return chat
+
+
+async def _store_responses_intermediate_messages(chat_id: str, chain_messages: list[dict]):
+    for message in chain_messages[:-1]:
+        await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message['id'], message)
+
+        parent_id = message.get('parentId')
+        if not parent_id:
+            continue
+
+        parent = await Chats.get_message_by_id_and_message_id(chat_id, parent_id)
+        if not parent:
+            continue
+
+        child_ids = parent.get('childrenIds', [])
+        if message['id'] not in child_ids:
+            child_ids.append(message['id'])
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id,
+                parent_id,
+                {'childrenIds': child_ids},
+            )
+
+
+##################################
+#
+# OpenAI Responses API Compatible Endpoint
+#
+##################################
+
+
+@app.post('/responses')
+@app.post('/v1/responses')
+@app.post('/api/responses')
+@app.post('/api/v1/responses')
+async def responses_create(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    if not isinstance(form_data, dict):
+        return _responses_error('Request body must be a JSON object')
+
+    if form_data.get('stream'):
+        return _responses_error('Streaming Responses API is not supported by this endpoint yet')
+
+    if not form_data.get('model'):
+        return _responses_error("Missing required field: 'model'")
+
+    if 'input' not in form_data:
+        return _responses_error("Missing required field: 'input'")
+
+    previous_response_id = form_data.get('previous_response_id')
+    previous_state = None
+    previous_messages = []
+    should_store = form_data.get('store') is not False
+
+    if previous_response_id:
+        previous_state = await ResponseStates.get_state_by_id(previous_response_id, user.id)
+        if not previous_state:
+            return _responses_error(
+                f"Previous response '{previous_response_id}' was not found",
+                status.HTTP_404_NOT_FOUND,
+                'not_found_error',
+            )
+
+        messages_map = await Chats.get_messages_map_by_chat_id(previous_state.chat_id)
+        previous_messages = get_message_list(messages_map, previous_state.message_id)
+        if not previous_messages:
+            return _responses_error(
+                f"Previous response '{previous_response_id}' no longer has stored context",
+                status.HTTP_404_NOT_FOUND,
+                'not_found_error',
+            )
+
+    new_messages = responses_input_to_messages(form_data.get('input'), form_data.get('instructions'))
+    if not new_messages:
+        return _responses_error("Field 'input' must contain at least one message or text item")
+
+    request.state.response_api = True
+
+    chat_payload = responses_payload_to_chat_payload(
+        form_data,
+        previous_messages=_responses_clean_stored_messages(previous_messages) if not should_store else None,
+    )
+    model_id = chat_payload.get('model')
+    chat_id = previous_state.chat_id if previous_state else f'responses-{uuid4()}'
+    parent_id = previous_state.message_id if previous_state else None
+    user_message_id = responses_message_id('user')
+    assistant_message_id = responses_message_id('asst')
+    chain_messages = _responses_input_chain(
+        new_messages=new_messages,
+        parent_id=parent_id,
+        model_id=model_id,
+        user_message_id=user_message_id,
+        assistant_message_id=assistant_message_id,
+    )
+    user_message = chain_messages[-1]
+
+    if should_store and previous_state is None:
+        chat = await _create_responses_chat_if_needed(
+            chat_id=chat_id,
+            model_id=model_id,
+            user_id=user.id,
+            chain_messages=chain_messages,
+            assistant_message_id=assistant_message_id,
+        )
+        if not chat:
+            return _responses_error(
+                'Failed to create internal chat state for Responses API request',
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                'server_error',
+            )
+
+    if should_store and previous_state is not None:
+        await _store_responses_intermediate_messages(chat_id, chain_messages)
+
+    chat_form_data = {
+        **chat_payload,
+        'stream': False,
+        'params': {
+            **(chat_payload.get('params') or {}),
+            'stream_response': False,
+        },
+        'metadata': {
+            **(chat_payload.get('metadata') or {}),
+            'response_api': True,
+            'previous_response_id': previous_response_id,
+        },
+    }
+
+    if should_store:
+        chat_form_data.update(
+            {
+                'chat_id': chat_id,
+                'parent_id': parent_id,
+                'id': assistant_message_id,
+                'assistant_message_id': assistant_message_id,
+                'user_message': user_message,
+            }
+        )
+
+    chat_response = await chat_completion(request, chat_form_data, user)
+    if isinstance(chat_response, StreamingResponse):
+        return _responses_error('Streaming Responses API is not supported by this endpoint yet')
+    if isinstance(chat_response, JSONResponse) and chat_response.status_code >= 400:
+        return chat_response
+
+    response_data = _extract_chat_response_data(chat_response)
+    if isinstance(response_data.get('error'), dict):
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=response_data)
+
+    assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
+    fallback_text = _extract_chat_response_text(response_data)
+    output = chat_message_to_responses_output(assistant_message, fallback_text=fallback_text)
+    usage = (
+        response_data.get('usage')
+        or (assistant_message.get('usage') if isinstance(assistant_message, dict) else None)
+        or {}
+    )
+
+    response_state_id = response_id()
+    response_body = chat_response_to_responses_response(
+        id=response_state_id,
+        model=model_id,
+        output=output,
+        usage=usage,
+        metadata=form_data.get('metadata') if isinstance(form_data.get('metadata'), dict) else {},
+        instructions=form_data.get('instructions'),
+        previous_response_id=previous_response_id,
+    )
+
+    if should_store:
+        await ResponseStates.insert_state(
+            id=response_state_id,
+            user_id=user.id,
+            chat_id=chat_id,
+            message_id=assistant_message_id,
+            model=model_id,
+            status=response_body.get('status', 'completed'),
+            input=form_data.get('input'),
+            instructions=form_data.get('instructions'),
+            output=output,
+            response=response_body,
+            usage=usage,
+            meta={
+                'previous_response_id': previous_response_id,
+                'chat_id': chat_id,
+                'user_message_id': user_message_id,
+            },
+            store=True,
+        )
+
+    return response_body
+
+
+@app.get('/responses/{response_id_value}')
+@app.get('/v1/responses/{response_id_value}')
+@app.get('/api/responses/{response_id_value}')
+@app.get('/api/v1/responses/{response_id_value}')
+async def responses_get(
+    response_id_value: str,
+    user=Depends(get_verified_user),
+):
+    state_item = await ResponseStates.get_state_by_id(response_id_value, user.id)
+    if not state_item or not state_item.response:
+        return _responses_error(
+            f"Response '{response_id_value}' was not found",
+            status.HTTP_404_NOT_FOUND,
+            'not_found_error',
+        )
+    return state_item.response
 
 
 ##################################

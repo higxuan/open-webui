@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -51,6 +52,7 @@ from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
 )
+from open_webui.utils.responses import responses_output_text
 from open_webui.utils.session_pool import (
     cleanup_response,
     get_session,
@@ -1076,12 +1078,7 @@ def convert_responses_result(response: dict) -> dict:
     """
     output_items = response.get('output', [])
 
-    content = ''
-    for item in output_items:
-        if item.get('type') == 'message':
-            for part in item.get('content', []):
-                if part.get('type') == 'output_text':
-                    content += part.get('text', '')
+    content = response.get('output_text') or responses_output_text(output_items)
 
     return {
         'id': response.get('id', ''),
@@ -1099,6 +1096,107 @@ def convert_responses_result(response: dict) -> dict:
         ],
         'usage': response.get('usage', {}),
     }
+
+
+def _metadata_requests_responses(metadata) -> bool:
+    return isinstance(metadata, dict) and metadata.get('response_api') is True
+
+
+def _is_chat_completions_unsupported(response) -> bool:
+    if isinstance(response, (dict, list)):
+        error_text = json.dumps(response, ensure_ascii=False)
+    else:
+        error_text = str(response or '')
+
+    error_text = error_text.lower()
+    return (
+        ('chat/completions' in error_text or 'chat completions' in error_text)
+        and ('not supported' in error_text or 'unsupported' in error_text)
+    )
+
+
+def _strip_chat_tool_image_parts(payload: dict):
+    # Chat Completions does not support images in tool content.
+    for message in payload.get('messages', []):
+        if message.get('role') == 'tool' and isinstance(message.get('content'), list):
+            message['content'] = ''.join(
+                part.get('text', '')
+                for part in message['content']
+                if part.get('type') in ('input_text', 'text')
+            )
+
+
+def _build_openai_chat_request(
+    url: str,
+    payload: dict,
+    api_config: dict,
+    use_responses: bool,
+) -> tuple[str, dict, dict]:
+    prepared_payload = copy.deepcopy(payload)
+    extra_headers = {}
+
+    if api_config.get('azure') or api_config.get('provider') == 'azure':
+        is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+
+        if is_azure_v1:
+            if use_responses:
+                prepared_payload = convert_to_responses_payload(prepared_payload)
+                request_url = f'{url.rstrip("/")}/responses'
+            else:
+                request_url = f'{url.rstrip("/")}/chat/completions'
+        else:
+            api_version = api_config.get('api_version', '2023-03-15-preview')
+            extra_headers['api-version'] = api_version
+            request_url, prepared_payload = convert_to_azure_payload(url, prepared_payload, api_version)
+
+            if use_responses:
+                prepared_payload = convert_to_responses_payload(prepared_payload)
+                request_url = f'{request_url}/responses?api-version={api_version}'
+            else:
+                request_url = f'{request_url}/chat/completions?api-version={api_version}'
+    else:
+        if use_responses:
+            prepared_payload = convert_to_responses_payload(prepared_payload)
+            request_url = f'{url}/responses'
+        else:
+            request_url = f'{url}/chat/completions'
+
+    if not use_responses:
+        _strip_chat_tool_image_parts(prepared_payload)
+
+    return request_url, prepared_payload, extra_headers
+
+
+async def _retry_openai_chat_request_with_responses(
+    *,
+    session,
+    url: str,
+    payload: dict,
+    api_config: dict,
+    headers: dict,
+    cookies,
+    requested_model: str | None,
+):
+    fallback_url, fallback_payload, fallback_extra_headers = _build_openai_chat_request(
+        url,
+        payload,
+        api_config,
+        True,
+    )
+    fallback_headers = {**headers, **fallback_extra_headers}
+    log.info(
+        'Provider rejected Chat Completions for model %s; retrying with Responses API',
+        requested_model,
+    )
+    return await session.request(
+        method='POST',
+        url=fallback_url,
+        data=json.dumps(fallback_payload),
+        headers=fallback_headers,
+        cookies=cookies,
+        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+    )
 
 
 @router.post('/chat/completions')
@@ -1202,51 +1300,25 @@ async def generate_chat_completion(
 
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
 
-    is_responses = api_config.get('api_type') == 'responses'
+    is_responses = (
+        api_config.get('api_type') == 'responses'
+        or _metadata_requests_responses(metadata)
+        or getattr(request.state, 'response_api', False)
+    )
 
     if api_config.get('azure') or api_config.get('provider') == 'azure':
         # Only set api-key header if not using Azure Entra ID authentication
         auth_type = api_config.get('auth_type', 'bearer')
         if auth_type not in ('azure_ad', 'microsoft_entra_id'):
             headers['api-key'] = key
-
-        # Azure v1 format: base URL already ends with /openai/v1,
-        # model stays in the payload, no deployment URL rewriting.
-        is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
-
-        if is_azure_v1:
-            if is_responses:
-                payload = convert_to_responses_payload(payload)
-                request_url = f'{url.rstrip("/")}/responses'
-            else:
-                request_url = f'{url.rstrip("/")}/chat/completions'
-        else:
-            api_version = api_config.get('api_version', '2023-03-15-preview')
-            request_url, payload = convert_to_azure_payload(url, payload, api_version)
-            headers['api-version'] = api_version
-
-            if is_responses:
-                payload = convert_to_responses_payload(payload)
-                request_url = f'{request_url}/responses?api-version={api_version}'
-            else:
-                request_url = f'{request_url}/chat/completions?api-version={api_version}'
-    else:
-        if is_responses:
-            payload = convert_to_responses_payload(payload)
-            request_url = f'{url}/responses'
-        else:
-            request_url = f'{url}/chat/completions'
     requested_model = payload.get('model')
-    # For Chat Completions, strip image parts from multimodal tool messages
-    # (Chat Completions doesn't support images in tool content).
-    if not is_responses and 'messages' in payload:
-        for message in payload['messages']:
-            if message.get('role') == 'tool' and isinstance(message.get('content'), list):
-                message['content'] = ''.join(
-                    part.get('text', '') for part in message['content'] if part.get('type') in ('input_text', 'text')
-                )
-
-    payload = json.dumps(payload)
+    request_url, request_payload, extra_headers = _build_openai_chat_request(
+        url,
+        payload,
+        api_config,
+        is_responses,
+    )
+    headers.update(extra_headers)
 
     r = None
     streaming = False
@@ -1258,7 +1330,7 @@ async def generate_chat_completion(
         r = await session.request(
             method='POST',
             url=request_url,
-            data=payload,
+            data=json.dumps(request_payload),
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
@@ -1277,6 +1349,39 @@ async def generate_chat_completion(
                     r.status,
                     error_body[:1000],
                 )
+                if not is_responses and _is_chat_completions_unsupported(error_body):
+                    await cleanup_response(r)
+                    r = None
+                    r = await _retry_openai_chat_request_with_responses(
+                        session=session,
+                        url=url,
+                        payload=payload,
+                        api_config=api_config,
+                        headers=headers,
+                        cookies=cookies,
+                        requested_model=requested_model,
+                    )
+                    is_responses = True
+
+                    if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                        streaming = True
+                        return StreamingResponse(
+                            stream_wrapper(r, content_handler=stream_chunks_handler),
+                            status_code=r.status,
+                            headers=_clean_proxy_headers(r.headers),
+                        )
+
+                    try:
+                        response = await r.json()
+                    except Exception as e:
+                        log.error(e)
+                        response = await r.text()
+
+                    if r.status < 400:
+                        if isinstance(response, dict):
+                            response = convert_responses_result(response)
+                        return response
+
                 try:
                     error_json = json.loads(error_body)
                     await publish_model_provider_request_failed(
@@ -1320,6 +1425,39 @@ async def generate_chat_completion(
                 response = await r.text()
 
             if r.status >= 400:
+                if not is_responses and _is_chat_completions_unsupported(response):
+                    await cleanup_response(r)
+                    r = None
+                    r = await _retry_openai_chat_request_with_responses(
+                        session=session,
+                        url=url,
+                        payload=payload,
+                        api_config=api_config,
+                        headers=headers,
+                        cookies=cookies,
+                        requested_model=requested_model,
+                    )
+                    is_responses = True
+
+                    if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                        streaming = True
+                        return StreamingResponse(
+                            stream_wrapper(r, content_handler=stream_chunks_handler),
+                            status_code=r.status,
+                            headers=_clean_proxy_headers(r.headers),
+                        )
+
+                    try:
+                        response = await r.json()
+                    except Exception as e:
+                        log.error(e)
+                        response = await r.text()
+
+                    if r.status < 400:
+                        if isinstance(response, dict):
+                            response = convert_responses_result(response)
+                        return response
+
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,

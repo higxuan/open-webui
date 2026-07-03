@@ -283,8 +283,9 @@ def convert_output_to_messages(
             content_parts = item.get('content', [])
             text = ''
             for part in content_parts:
-                if part.get('type') == 'output_text':
-                    text += part.get('text', '')
+                if part.get('type') in ('input_text', 'output_text', 'text') or 'text' in part:
+                    output_text = part.get('text', '')
+                    text += output_text if isinstance(output_text, str) else str(output_text)
             if text:
                 pending_content.append(text)
 

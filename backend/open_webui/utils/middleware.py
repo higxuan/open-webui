@@ -113,6 +113,7 @@ from open_webui.utils.misc import (
 from open_webui.utils.payload import apply_system_prompt_to_body, resolve_system_prompt
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.response import merge_usage, normalize_usage
+from open_webui.utils.responses import responses_output_text
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.task import (
     get_task_model_id,
@@ -473,6 +474,16 @@ def handle_responses_streaming_event(
             else:
                 item['content'].append(part)
             return new_output, None
+        if part and output_index in (0, -1):
+            return [
+                {
+                    'type': 'message',
+                    'id': output_id('msg'),
+                    'status': 'in_progress',
+                    'role': 'assistant',
+                    'content': [part],
+                }
+            ], None
         return current_output, None
 
     elif event_type == 'response.reasoning_summary_part.added':
@@ -501,6 +512,17 @@ def handle_responses_streaming_event(
             delta = data.get('delta', '')
 
             output_index = data.get('output_index', len(current_output) - 1)
+
+            if not current_output and output_index in (0, -1) and delta_type in ['text', 'output_text']:
+                return [
+                    {
+                        'type': 'message',
+                        'id': output_id('msg'),
+                        'status': 'in_progress',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': str(delta)}],
+                    }
+                ], None
 
             if current_output and 0 <= output_index < len(current_output):
                 new_output = list(current_output)
@@ -722,7 +744,23 @@ def handle_responses_streaming_event(
         response_data = data.get('response', {})
         final_output = response_data.get('output')
 
-        new_output = final_output if final_output is not None else current_output
+        # Some Responses-compatible providers send an empty final output on
+        # response.completed even though the useful text already arrived in
+        # output_text.delta events.  Keep the accumulated stream in that case.
+        if final_output or current_output:
+            new_output = final_output if final_output or not current_output else current_output
+        elif response_data.get('output_text'):
+            new_output = [
+                {
+                    'type': 'message',
+                    'id': output_id('msg'),
+                    'status': 'completed',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': response_data.get('output_text', '')}],
+                }
+            ]
+        else:
+            new_output = current_output
 
         # Ensure reasoning items are marked as completed in the final output
         if new_output:
@@ -1975,7 +2013,21 @@ async def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[
         return None
 
     return [
-        {k: v for k, v in msg.items() if k in ('role', 'content', 'output', 'files', 'contextSummary')}
+        {
+            k: v
+            for k, v in msg.items()
+            if k
+            in (
+                'role',
+                'content',
+                'output',
+                'tool_calls',
+                'tool_call_id',
+                'name',
+                'files',
+                'contextSummary',
+            )
+        }
         for msg in db_messages
     ]
 
@@ -2952,6 +3004,9 @@ def update_assistant_message_from_stream(assistant_message, raw):
             output, meta = handle_responses_streaming_event(data, assistant_message.get('output', []))
             if output:
                 assistant_message['output'] = output
+                content = responses_output_text(output)
+                if content:
+                    assistant_message['content'] = content
             if meta and meta.get('usage'):
                 assistant_message['usage'] = merge_usage(assistant_message.get('usage'), meta['usage'])
             continue
@@ -3469,6 +3524,8 @@ async def non_streaming_chat_response_handler(response, ctx):
             choices = response_data.get('choices', [])
             response_output = response_data.get('output')
             content = choices[0].get('message', {}).get('content') if choices else ''
+            if not content and response_output:
+                content = responses_output_text(response_output)
 
             if choices and (content or response_output):
                 if content or response_output:
@@ -3541,6 +3598,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                             {
                                 'done': True,
                                 'role': 'assistant',
+                                'content': content,
                                 'output': response_output,
                                 **({'usage': usage} if usage else {}),
                             },
@@ -3581,6 +3639,8 @@ async def non_streaming_chat_response_handler(response, ctx):
     choices = response_data.get('choices', [])
     output = response_data.get('output')
     content = choices[0].get('message', {}).get('content') if choices else ''
+    if not content and output:
+        content = responses_output_text(output)
     if ENABLE_API_OUTLET_FILTERS and (content or output):
         usage = normalize_usage(response_data.get('usage', {}) or {})
         ctx['assistant_message'] = {
@@ -4105,6 +4165,10 @@ async def streaming_chat_response_handler(response, ctx):
                                     processed_data = {
                                         'output': full_output(),
                                     }
+                                    current_content = responses_output_text(processed_data['output'])
+                                    if current_content:
+                                        content = current_content
+                                        processed_data['content'] = current_content
 
                                     # print(data)
                                     # print(processed_data)
@@ -4504,20 +4568,25 @@ async def streaming_chat_response_handler(response, ctx):
                                         if ENABLE_REALTIME_CHAT_SAVE and not metadata.get('chat_id', '').startswith(
                                             'channel:'
                                         ):
+                                            visible_content = responses_output_text(full_output()) or content
                                             # Save message in the database
                                             await Chats.upsert_message_to_chat_by_id_and_message_id(
                                                 metadata['chat_id'],
                                                 metadata['message_id'],
                                                 {
+                                                    'content': visible_content,
                                                     'output': full_output(),
                                                 },
                                             )
                                             data = {
+                                                'content': visible_content,
                                                 'output': full_output(),
                                             }
                                             delta_type = 'content'
                                         else:
+                                            visible_content = responses_output_text(full_output()) or content
                                             data = {
+                                                'content': visible_content,
                                                 'output': full_output(),
                                             }
                                             delta_type = 'content'
@@ -5210,6 +5279,7 @@ async def streaming_chat_response_handler(response, ctx):
                     if item.get('status') == 'in_progress':
                         item['status'] = 'completed'
 
+                content = responses_output_text(output) or content
                 title = (
                     await Chats.get_chat_title_by_id(metadata['chat_id'])
                     if not metadata.get('chat_id', '').startswith('channel:')
@@ -5217,6 +5287,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
                 data = {
                     'done': True,
+                    'content': content,
                     'output': output,
                     'title': title,
                     **({'usage': usage} if usage else {}),
@@ -5230,6 +5301,7 @@ async def streaming_chat_response_handler(response, ctx):
                             metadata['message_id'],
                             {
                                 'done': True,
+                                'content': content,
                                 'output': output,
                                 **({'usage': usage} if usage else {}),
                             },
@@ -5238,13 +5310,13 @@ async def streaming_chat_response_handler(response, ctx):
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True, 'usage': usage},
+                            {'done': True, 'content': content, 'usage': usage},
                         )
                     else:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True},
+                            {'done': True, 'content': content},
                         )
 
                 # Send a webhook notification if the user is not active
@@ -5272,6 +5344,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
 
                 ctx['assistant_message'] = {
+                    'content': content,
                     'output': output,
                     **({'usage': usage} if usage else {}),
                 }
