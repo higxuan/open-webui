@@ -28,6 +28,7 @@ from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES,
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     ENABLE_OPENAI_API_PASSTHROUGH,
@@ -1131,6 +1132,7 @@ def _build_openai_chat_request(
     payload: dict,
     api_config: dict,
     use_responses: bool,
+    force_responses_stream: bool = False,
 ) -> tuple[str, dict, dict]:
     prepared_payload = copy.deepcopy(payload)
     extra_headers = {}
@@ -1161,6 +1163,9 @@ def _build_openai_chat_request(
         else:
             request_url = f'{url}/chat/completions'
 
+    if use_responses and force_responses_stream:
+        prepared_payload['stream'] = True
+
     if not use_responses:
         _strip_chat_tool_image_parts(prepared_payload)
 
@@ -1182,6 +1187,7 @@ async def _retry_openai_chat_request_with_responses(
         payload,
         api_config,
         True,
+        force_responses_stream=payload.get('stream') is True,
     )
     fallback_headers = {**headers, **fallback_extra_headers}
     log.info(
@@ -1195,7 +1201,7 @@ async def _retry_openai_chat_request_with_responses(
         headers=fallback_headers,
         cookies=cookies,
         ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
     )
 
 
@@ -1317,6 +1323,7 @@ async def generate_chat_completion(
         payload,
         api_config,
         is_responses,
+        force_responses_stream=payload.get('stream') is True and not getattr(request.state, 'response_api', False),
     )
     headers.update(extra_headers)
 
@@ -1334,7 +1341,9 @@ async def generate_chat_completion(
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(
+                total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES if is_responses else AIOHTTP_CLIENT_TIMEOUT
+            ),
         )
 
         # Check if response is SSE
@@ -1677,7 +1686,7 @@ async def responses(
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
         )
 
         # Check if response is SSE

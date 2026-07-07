@@ -565,6 +565,14 @@ try:
 except (ValueError, TypeError):
     AIOHTTP_CLIENT_TIMEOUT = 300
 
+_openai_responses_timeout_raw = os.getenv('AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES', '900')
+try:
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES = (
+        int(_openai_responses_timeout_raw) if _openai_responses_timeout_raw else None
+    )
+except (ValueError, TypeError):
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES = 900
+
 
 # SSL verification for general outbound requests (OpenAI, OAuth, etc.).
 # Accepts "True", "False", or a path to a CA bundle file.
