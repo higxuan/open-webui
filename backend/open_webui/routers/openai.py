@@ -1116,6 +1116,61 @@ def _is_chat_completions_unsupported(response) -> bool:
     )
 
 
+def _is_responses_stream_required(response) -> bool:
+    if isinstance(response, (dict, list)):
+        error_text = json.dumps(response, ensure_ascii=False)
+    else:
+        error_text = str(response or '')
+
+    error_text = error_text.lower()
+    return 'stream' in error_text and 'true' in error_text and ('must' in error_text or 'required' in error_text)
+
+
+def _extract_responses_stream_result(response_text: str) -> dict:
+    completed_response = None
+    output_items = []
+    output_text = ''
+
+    for line in response_text.splitlines():
+        if not line.startswith('data:'):
+            continue
+
+        payload = line[5:].strip()
+        if not payload or payload == '[DONE]':
+            continue
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        event_type = data.get('type', '')
+        if event_type == 'response.completed' and isinstance(data.get('response'), dict):
+            completed_response = data['response']
+            continue
+
+        if event_type == 'response.output_item.done' and isinstance(data.get('item'), dict):
+            output_items.append(data['item'])
+            continue
+
+        if event_type in ('response.output_text.delta', 'response.text.delta'):
+            output_text += str(data.get('delta') or '')
+
+    if completed_response is not None:
+        return completed_response
+
+    return {
+        'output': output_items,
+        'output_text': output_text,
+    }
+
+
+async def _consume_responses_stream_as_chat_completion(response) -> dict:
+    response_text = await response.text()
+    response_data = _extract_responses_stream_result(response_text)
+    return convert_responses_result(response_data)
+
+
 def _strip_chat_tool_image_parts(payload: dict):
     # Chat Completions does not support images in tool content.
     for message in payload.get('messages', []):
@@ -1172,6 +1227,35 @@ def _build_openai_chat_request(
     return request_url, prepared_payload, extra_headers
 
 
+async def _request_openai_chat_with_responses(
+    *,
+    session,
+    url: str,
+    payload: dict,
+    api_config: dict,
+    headers: dict,
+    cookies,
+    force_responses_stream: bool,
+):
+    responses_url, responses_payload, responses_extra_headers = _build_openai_chat_request(
+        url,
+        payload,
+        api_config,
+        True,
+        force_responses_stream=force_responses_stream,
+    )
+    responses_headers = {**headers, **responses_extra_headers}
+    return await session.request(
+        method='POST',
+        url=responses_url,
+        data=json.dumps(responses_payload),
+        headers=responses_headers,
+        cookies=cookies,
+        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
+    )
+
+
 async def _retry_openai_chat_request_with_responses(
     *,
     session,
@@ -1181,27 +1265,22 @@ async def _retry_openai_chat_request_with_responses(
     headers: dict,
     cookies,
     requested_model: str | None,
+    force_responses_stream: bool | None = None,
 ):
-    fallback_url, fallback_payload, fallback_extra_headers = _build_openai_chat_request(
-        url,
-        payload,
-        api_config,
-        True,
-        force_responses_stream=payload.get('stream') is True,
-    )
-    fallback_headers = {**headers, **fallback_extra_headers}
     log.info(
         'Provider rejected Chat Completions for model %s; retrying with Responses API',
         requested_model,
     )
-    return await session.request(
-        method='POST',
-        url=fallback_url,
-        data=json.dumps(fallback_payload),
-        headers=fallback_headers,
+    return await _request_openai_chat_with_responses(
+        session=session,
+        url=url,
+        payload=payload,
+        api_config=api_config,
+        headers=headers,
         cookies=cookies,
-        ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
+        force_responses_stream=payload.get('stream') is True
+        if force_responses_stream is None
+        else force_responses_stream,
     )
 
 
@@ -1232,9 +1311,13 @@ async def generate_chat_completion(
 
     model_id = form_data.get('model')
     model_info = await Models.get_model_by_id(model_id)
+    model_requests_responses = False
 
     # Check model info and override the payload
     if model_info:
+        model_meta = model_info.meta.model_dump() if model_info.meta else {}
+        model_requests_responses = model_meta.get('response_api') is True or model_meta.get('api_type') == 'responses'
+
         if model_info.base_model_id:
             base_model_id = (
                 request.base_model_id if hasattr(request, 'base_model_id') else model_info.base_model_id
@@ -1308,6 +1391,7 @@ async def generate_chat_completion(
 
     is_responses = (
         api_config.get('api_type') == 'responses'
+        or model_requests_responses
         or _metadata_requests_responses(metadata)
         or getattr(request.state, 'response_api', False)
     )
@@ -1466,6 +1550,48 @@ async def generate_chat_completion(
                         if isinstance(response, dict):
                             response = convert_responses_result(response)
                         return response
+
+                if is_responses and _is_responses_stream_required(response):
+                    await cleanup_response(r)
+                    r = None
+                    r = await _request_openai_chat_with_responses(
+                        session=session,
+                        url=url,
+                        payload=payload,
+                        api_config=api_config,
+                        headers=headers,
+                        cookies=cookies,
+                        force_responses_stream=True,
+                    )
+
+                    if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                        if r.status < 400:
+                            if payload.get('stream') is True:
+                                streaming = True
+                                return StreamingResponse(
+                                    stream_wrapper(r, content_handler=stream_chunks_handler),
+                                    status_code=r.status,
+                                    headers=_clean_proxy_headers(r.headers),
+                                )
+
+                            return await _consume_responses_stream_as_chat_completion(r)
+
+                        error_body = await r.text()
+                        try:
+                            response = json.loads(error_body)
+                        except Exception:
+                            response = error_body
+                    else:
+                        try:
+                            response = await r.json()
+                        except Exception as e:
+                            log.error(e)
+                            response = await r.text()
+
+                        if r.status < 400:
+                            if isinstance(response, dict):
+                                response = convert_responses_result(response)
+                            return response
 
                 await publish_model_provider_request_failed(
                     request,

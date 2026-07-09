@@ -162,6 +162,7 @@ class ModelsTable:
                 description='Image generation preset via NewAPI Responses',
                 capabilities={'vision': True, 'image_generation': True},
                 defaultFeatureIds=['image_generation'],
+                response_api=True,
                 builtin=True,
             ),
             access_grants=[],
