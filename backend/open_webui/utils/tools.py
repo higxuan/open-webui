@@ -44,6 +44,7 @@ from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 from open_webui.models.tools import Tools
 from open_webui.models.users import UserModel
+from open_webui.routers.images import has_responses_image_generation_config
 from open_webui.tools.builtin import (
     add_memory,
     calculate_timestamp,
@@ -489,6 +490,8 @@ async def get_builtin_tools(
     config = await Config.get_many(
         'web.search.enable',
         'image_generation.enable',
+        'image_generation.engine',
+        'image_generation.openai.params',
         'images.edit.enable',
         'code_interpreter.enable',
         'notes.enable',
@@ -600,7 +603,16 @@ async def get_builtin_tools(
         builtin_functions.append(generate_image)
     if (
         is_builtin_tool_enabled('image_generation')
-        and config.get('images.edit.enable')
+        and (
+            config.get('images.edit.enable')
+            or has_responses_image_generation_config(
+                {
+                    'ENABLE_IMAGE_GENERATION': config.get('image_generation.enable'),
+                    'IMAGE_GENERATION_ENGINE': config.get('image_generation.engine'),
+                    'IMAGES_OPENAI_API_PARAMS': config.get('image_generation.openai.params'),
+                }
+            )
+        )
         and get_model_capability('image_generation')
         and features.get('image_generation')
         and await has_user_permission('image_generation')

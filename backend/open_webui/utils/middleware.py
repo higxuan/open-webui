@@ -50,6 +50,7 @@ from open_webui.retrieval.utils import get_sources_from_items
 from open_webui.routers.images import (
     CreateImageForm,
     EditImageForm,
+    has_responses_image_generation_config,
     image_edits,
     image_generations,
 )
@@ -1595,6 +1596,26 @@ async def add_file_context(messages: list, chat_id: str, user) -> list:
     return messages
 
 
+async def is_image_edit_enabled_for_generation_config() -> bool:
+    config = await Config.get_many(
+        'images.edit.enable',
+        'image_generation.enable',
+        'image_generation.engine',
+        'image_generation.openai.params',
+    )
+
+    return bool(
+        config.get('images.edit.enable')
+        or has_responses_image_generation_config(
+            {
+                'ENABLE_IMAGE_GENERATION': config.get('image_generation.enable'),
+                'IMAGE_GENERATION_ENGINE': config.get('image_generation.engine'),
+                'IMAGES_OPENAI_API_PARAMS': config.get('image_generation.openai.params'),
+            }
+        )
+    )
+
+
 async def chat_image_generation_handler(request: Request, form_data: dict, extra_params: dict, user):
     metadata = extra_params.get('__metadata__', {})
     chat_id = metadata.get('chat_id', None)
@@ -1634,7 +1655,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
 
     system_message_content = ''
 
-    if len(input_images) > 0 and await Config.get('images.edit.enable'):
+    if len(input_images) > 0 and await is_image_edit_enabled_for_generation_config():
         # Edit image(s)
         try:
             images = await image_edits(

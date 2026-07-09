@@ -1,9 +1,11 @@
 import json
 
 from open_webui.routers.images import (
+    apply_image_edit_defaults,
     build_responses_image_input,
     build_responses_image_tool,
     extract_response_image_b64,
+    has_responses_image_generation_config,
 )
 
 
@@ -69,3 +71,40 @@ def test_build_responses_image_tool_merges_configured_tool_options():
         'size': '1024x1024',
         'quality': 'high',
     }
+
+
+def test_apply_image_edit_defaults_reuses_responses_generation_connection():
+    values = {
+        'ENABLE_IMAGE_GENERATION': True,
+        'IMAGE_GENERATION_ENGINE': 'openai',
+        'IMAGE_GENERATION_MODEL': 'gpt-5.5',
+        'IMAGES_OPENAI_API_BASE_URL': 'https://newapi.example/v1',
+        'IMAGES_OPENAI_API_KEY': 'sk-generation',
+        'IMAGES_OPENAI_API_VERSION': '',
+        'IMAGES_OPENAI_API_PARAMS': {'api_type': 'responses'},
+        'ENABLE_IMAGE_EDIT': False,
+        'IMAGE_EDIT_ENGINE': 'openai',
+        'IMAGE_EDIT_MODEL': '',
+        'IMAGE_EDIT_SIZE': '',
+        'IMAGES_EDIT_OPENAI_API_BASE_URL': 'https://api.openai.com/v1',
+        'IMAGES_EDIT_OPENAI_API_KEY': '',
+        'IMAGES_EDIT_OPENAI_API_VERSION': '',
+    }
+
+    normalized = apply_image_edit_defaults(values)
+
+    assert normalized['ENABLE_IMAGE_EDIT'] is True
+    assert normalized['IMAGE_EDIT_ENGINE'] == 'openai'
+    assert normalized['IMAGE_EDIT_MODEL'] == 'gpt-5.5'
+    assert normalized['IMAGES_EDIT_OPENAI_API_BASE_URL'] == 'https://newapi.example/v1'
+    assert normalized['IMAGES_EDIT_OPENAI_API_KEY'] == 'sk-generation'
+
+
+def test_has_responses_image_generation_config_accepts_json_string_params():
+    assert has_responses_image_generation_config(
+        {
+            'ENABLE_IMAGE_GENERATION': True,
+            'IMAGE_GENERATION_ENGINE': 'openai',
+            'IMAGES_OPENAI_API_PARAMS': '{"api_type":"responses"}',
+        }
+    )

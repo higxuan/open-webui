@@ -111,8 +111,48 @@ async def get_config_values(key_map: dict[str, str]) -> dict:
     return {field: values[storage_key] for field, storage_key in key_map.items() if storage_key in values}
 
 
+def _coerce_openai_image_params(params: dict | str | None) -> dict:
+    if isinstance(params, str):
+        try:
+            return json.loads(params) if params else {}
+        except json.JSONDecodeError:
+            return {}
+    return params or {}
+
+
+def has_responses_image_generation_config(values: dict) -> bool:
+    return (
+        values.get('ENABLE_IMAGE_GENERATION') is True
+        and values.get('IMAGE_GENERATION_ENGINE') == 'openai'
+        and _coerce_openai_image_params(values.get('IMAGES_OPENAI_API_PARAMS')).get('api_type') == 'responses'
+    )
+
+
+def apply_image_edit_defaults(values: dict) -> dict:
+    values = {**values}
+    if not has_responses_image_generation_config(values):
+        return values
+
+    values['ENABLE_IMAGE_EDIT'] = True
+    values['IMAGE_EDIT_ENGINE'] = values.get('IMAGE_EDIT_ENGINE') or 'openai'
+    values['IMAGE_EDIT_MODEL'] = values.get('IMAGE_EDIT_MODEL') or values.get('IMAGE_GENERATION_MODEL') or ''
+    values['IMAGE_EDIT_SIZE'] = values.get('IMAGE_EDIT_SIZE') or values.get('IMAGE_SIZE') or ''
+    values['IMAGES_EDIT_OPENAI_API_BASE_URL'] = (
+        values.get('IMAGES_EDIT_OPENAI_API_BASE_URL')
+        if values.get('IMAGES_EDIT_OPENAI_API_KEY')
+        else values.get('IMAGES_OPENAI_API_BASE_URL', values.get('IMAGES_EDIT_OPENAI_API_BASE_URL', ''))
+    )
+    values['IMAGES_EDIT_OPENAI_API_KEY'] = values.get('IMAGES_EDIT_OPENAI_API_KEY') or values.get(
+        'IMAGES_OPENAI_API_KEY', ''
+    )
+    values['IMAGES_EDIT_OPENAI_API_VERSION'] = values.get('IMAGES_EDIT_OPENAI_API_VERSION') or values.get(
+        'IMAGES_OPENAI_API_VERSION', ''
+    )
+    return values
+
+
 async def get_image_config() -> SimpleNamespace:
-    return SimpleNamespace(**await get_config_values(IMAGE_CONFIG_KEYS))
+    return SimpleNamespace(**apply_image_edit_defaults(await get_config_values(IMAGE_CONFIG_KEYS)))
 
 
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
@@ -327,7 +367,7 @@ class ImagesConfig(BaseModel):
 
 @router.get('/config', response_model=ImagesConfig)
 async def get_config(request: Request, user=Depends(get_admin_user)):
-    return await get_config_values(IMAGE_CONFIG_KEYS)
+    return apply_image_edit_defaults(await get_config_values(IMAGE_CONFIG_KEYS))
 
 
 @router.post('/config/update')
@@ -360,7 +400,7 @@ async def update_config(request: Request, form_data: ImagesConfig, user=Depends(
     updates['images.edit.comfyui.base_url'] = form_data.IMAGES_EDIT_COMFYUI_BASE_URL.strip('/')
     await Config.upsert(updates)
     await set_image_model(request, form_data.IMAGE_GENERATION_MODEL)
-    values = await get_config_values(IMAGE_CONFIG_KEYS)
+    values = apply_image_edit_defaults(await get_config_values(IMAGE_CONFIG_KEYS))
     await publish_event(
         request,
         EVENTS.CONFIG_UPDATED,
