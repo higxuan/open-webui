@@ -1218,7 +1218,7 @@ def _build_openai_chat_request(
         else:
             request_url = f'{url}/chat/completions'
 
-    if use_responses and force_responses_stream:
+    if use_responses:
         prepared_payload['stream'] = True
 
     if not use_responses:
@@ -1503,6 +1503,9 @@ async def generate_chat_completion(
                         status_code=r.status,
                         content={'error': {'message': error_body, 'code': r.status}},
                     )
+
+            if is_responses and payload.get('stream') is not True:
+                return await _consume_responses_stream_as_chat_completion(r)
 
             streaming = True
             return StreamingResponse(

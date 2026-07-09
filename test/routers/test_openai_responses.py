@@ -2,6 +2,7 @@ import json
 
 from open_webui.models.models import BUILTIN_IMAGE_MODEL_ID, Models
 from open_webui.routers.openai import (
+    _build_openai_chat_request,
     _extract_responses_stream_result,
     _is_responses_stream_required,
     convert_responses_result,
@@ -42,3 +43,19 @@ def test_builtin_image_model_requests_responses_api():
     model = Models._get_builtin_model_by_id(BUILTIN_IMAGE_MODEL_ID)
 
     assert model.meta.model_dump().get('response_api') is True
+
+
+def test_responses_chat_request_forces_upstream_streaming_for_non_stream_call():
+    request_url, payload, _ = _build_openai_chat_request(
+        'https://newapi.example/v1',
+        {
+            'model': 'gpt-5.5',
+            'messages': [{'role': 'user', 'content': 'title this'}],
+            'stream': False,
+        },
+        {'api_type': 'responses'},
+        use_responses=True,
+    )
+
+    assert request_url == 'https://newapi.example/v1/responses'
+    assert payload['stream'] is True
