@@ -24,7 +24,12 @@ from open_webui.config import (
     IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
 )
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.env import AIOHTTP_CLIENT_ALLOW_REDIRECTS, AIOHTTP_CLIENT_SESSION_SSL, ENABLE_FORWARD_USER_INFO_HEADERS
+from open_webui.env import (
+    AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+    AIOHTTP_CLIENT_SESSION_SSL,
+    AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES,
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+)
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.chats import Chats
@@ -251,6 +256,30 @@ def extract_response_image_b64(response_text: str) -> str | None:
                     image_b64 = item['result']
 
     return image_b64
+
+
+def get_openai_image_api_params(image_config) -> dict:
+    openai_api_params = image_config.IMAGES_OPENAI_API_PARAMS or {}
+    if isinstance(openai_api_params, str):
+        return json.loads(openai_api_params) if openai_api_params else {}
+    return openai_api_params
+
+
+def build_responses_image_tool(size: str | None, openai_api_params: dict) -> dict:
+    return {
+        'type': 'image_generation',
+        **({'size': size} if size else {}),
+        **openai_api_params.get('tool', {}),
+    }
+
+
+def build_responses_image_input(prompt: str, images: str | list[str] | None = None) -> list[dict]:
+    content = [{'type': 'input_text', 'text': prompt}]
+    if images:
+        image_items = images if isinstance(images, list) else [images]
+        content.extend({'type': 'input_image', 'image_url': image} for image in image_items)
+
+    return [{'role': 'user', 'content': content}]
 
 
 class ImagesConfig(BaseModel):
@@ -653,21 +682,15 @@ async def image_generations(
                 headers = include_user_info_headers(headers, user)
 
             session = await get_session()
-            openai_api_params = image_config.IMAGES_OPENAI_API_PARAMS or {}
-            if isinstance(openai_api_params, str):
-                openai_api_params = json.loads(openai_api_params) if openai_api_params else {}
+            openai_api_params = get_openai_image_api_params(image_config)
 
             if openai_api_params.get('api_type') == 'responses':
                 url = f'{image_config.IMAGES_OPENAI_API_BASE_URL}/responses'
-                tool = {
-                    'type': 'image_generation',
-                    'size': form_data.size or image_config.IMAGE_SIZE or size,
-                    **openai_api_params.get('tool', {}),
-                }
+                tool = build_responses_image_tool(form_data.size or image_config.IMAGE_SIZE or size, openai_api_params)
                 data = {
                     'model': model,
                     'stream': True,
-                    'input': [{'role': 'user', 'content': form_data.prompt}],
+                    'input': build_responses_image_input(form_data.prompt),
                     'tools': [tool],
                 }
 
@@ -676,6 +699,7 @@ async def image_generations(
                     json=data,
                     headers=headers,
                     ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
                 ) as r:
                     r.raise_for_status()
                     response_chunks = []
@@ -1034,6 +1058,39 @@ async def image_edits(
             if ENABLE_FORWARD_USER_INFO_HEADERS:
                 headers = include_user_info_headers(headers, user)
 
+            session = await get_session()
+            openai_api_params = get_openai_image_api_params(image_config)
+
+            if openai_api_params.get('api_type') == 'responses':
+                url = f'{image_config.IMAGES_EDIT_OPENAI_API_BASE_URL}/responses'
+                tool = build_responses_image_tool(size or image_config.IMAGE_EDIT_SIZE, openai_api_params)
+                data = {
+                    'model': model,
+                    'stream': True,
+                    'input': build_responses_image_input(form_data.prompt, form_data.image),
+                    'tools': [tool],
+                }
+
+                async with session.post(
+                    url=url,
+                    json=data,
+                    headers={**headers, 'Content-Type': 'application/json'},
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_RESPONSES),
+                ) as r:
+                    r.raise_for_status()
+                    response_chunks = []
+                    async for chunk in r.content.iter_chunked(8192):
+                        response_chunks.append(chunk.decode('utf-8', 'ignore'))
+
+                image_b64 = extract_response_image_b64(''.join(response_chunks))
+                if not image_b64:
+                    raise ValueError('No image payload found in Responses stream')
+
+                image_data, content_type = await get_image_data(image_b64)
+                _, url = await upload_image(request, image_data, content_type, {**data, **metadata}, user)
+                return [{'url': url}]
+
             data = {
                 'model': model,
                 'prompt': form_data.prompt,
@@ -1081,7 +1138,6 @@ async def image_edits(
                     content_type=content_type_val,
                 )
 
-            session = await get_session()
             async with session.post(
                 url=f'{image_config.IMAGES_EDIT_OPENAI_API_BASE_URL}/images/edits{url_search_params}',
                 headers=headers,
